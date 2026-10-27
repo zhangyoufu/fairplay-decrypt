@@ -11,20 +11,25 @@ import tempfile
 from pathlib import Path
 from zipfile import ZipFile
 
-from core import arm64_encryption_info, decrypt_binary
+from core import decrypt_binary, macho_slices
 
 ROOT = Path(__file__).resolve().parent
 COPY_BUFSIZE = 64 * 1024
+SUPF_SUFFIXES = (".v5.supf", ".supf", ".v4.supp", ".supp")
 
 
-def supf_paths(names: set[str]) -> list[str]:
-    by_binary = {}
+def supf_candidates(names: set[str]) -> dict[str, list[str]]:
+    by_binary: dict[str, list[tuple[int, str]]] = {}
     for name in sorted(names):
-        if name.endswith(".v5.supf"):
-            by_binary[name.removesuffix(".v5.supf")] = name
-        elif name.endswith(".supf"):
-            by_binary.setdefault(name.removesuffix(".supf"), name)
-    return sorted(by_binary.values())
+        for priority, suffix in enumerate(SUPF_SUFFIXES):
+            if name.endswith(suffix):
+                stem = name.removesuffix(suffix)
+                by_binary.setdefault(stem, []).append((priority, name))
+                break
+    return {
+        stem: [name for _priority, name in sorted(entries)]
+        for stem, entries in by_binary.items()
+    }
 
 
 def enclosing_app_sinf(names: set[str], bundle: str) -> str | None:
@@ -80,33 +85,39 @@ def main() -> None:
         if len(names) != len(members):
             raise ValueError("input ZIP has duplicate member names")
         plan = []
-        for supf_path in supf_paths(names):
+        for candidates in supf_candidates(names).values():
+            supf_path = next(
+                (name for name in candidates if archive.getinfo(name).file_size), None
+            )
+            if supf_path is None:
+                continue
             parts = supf_path.rsplit("/SC_Info/", 1)
             if len(parts) != 2:
                 raise ValueError(f"SUPF outside SC_Info: {supf_path}")
             bundle, filename = parts
-            stem = (
-                filename.removesuffix(".v5.supf")
-                if filename.endswith(".v5.supf")
-                else filename.removesuffix(".supf")
-            )
+            suffix = next(s for s in SUPF_SUFFIXES if filename.endswith(s))
+            stem = filename.removesuffix(suffix)
             binary_path = bundle + "/" + stem
-            sinf_name = (
-                stem + ".v4.sinf" if filename.endswith(".v5.supf") else stem + ".sinf"
+            sinf_names = [stem + ".sinf"]
+            if suffix in (".v5.supf", ".v4.supp"):
+                sinf_names.insert(0, stem + ".v4.sinf")
+            sinf_path = next(
+                (
+                    bundle + "/SC_Info/" + name
+                    for name in sinf_names
+                    if bundle + "/SC_Info/" + name in names
+                ),
+                None,
             )
-            sinf_path = bundle + "/SC_Info/" + sinf_name
-            if sinf_path not in names and filename.endswith(".v5.supf"):
-                sinf_path = bundle + "/SC_Info/" + stem + ".sinf"
             if binary_path not in names:
                 raise ValueError(f"SUPF lacks binary/SINF: {supf_path}")
             source = archive.read(binary_path)
-            try:
-                arm64_encryption_info(source)
-            except ValueError as error:
-                if str(error).startswith("unsupported cryptid/size: 0,"):
-                    continue
-                raise
-            if sinf_path not in names:
+            if not any(image.cryptid == 1 for image in macho_slices(source)):
+                continue
+            supf = archive.read(supf_path)
+            if not supf:
+                continue
+            if sinf_path is None:
                 fallback = enclosing_app_sinf(names, bundle)
                 if fallback is None:
                     raise ValueError(f"SUPF lacks binary/SINF: {supf_path}")
@@ -116,11 +127,11 @@ def main() -> None:
                     binary_path,
                     source,
                     archive.read(sinf_path),
-                    archive.read(supf_path),
+                    supf,
                 )
             )
         if not plan:
-            raise ValueError("no encrypted arm64 binaries with supported SINF/SUPF")
+            raise ValueError("no encrypted binaries with supported SINF/SUPF")
         replacements = {}
         total_pages = 0
         for ordinal, (binary_path, source, sinf, supf) in enumerate(plan, 1):
