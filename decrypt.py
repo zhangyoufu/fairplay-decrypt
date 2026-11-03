@@ -18,12 +18,16 @@ COPY_BUFSIZE = 64 * 1024
 
 
 def supf_paths(names: set[str]) -> list[str]:
-    by_binary = {}
+    # Newest-generation suffixes take precedence for a given binary; the
+    # f-class (.supf/.v5.supf) and p-class (.supp/.v4.supp) containers are
+    # both accepted, since either may carry the per-page keys.
+    suffixes = (".v5.supf", ".v4.supp", ".supf", ".supp")
+    by_binary: dict[str, str] = {}
     for name in sorted(names):
-        if name.endswith(".v5.supf"):
-            by_binary[name.removesuffix(".v5.supf")] = name
-        elif name.endswith(".supf"):
-            by_binary.setdefault(name.removesuffix(".supf"), name)
+        for suffix in suffixes:
+            if name.endswith(suffix):
+                by_binary.setdefault(name.removesuffix(suffix), name)
+                break
     return sorted(by_binary.values())
 
 
@@ -85,17 +89,18 @@ def main() -> None:
             if len(parts) != 2:
                 raise ValueError(f"SUPF outside SC_Info: {supf_path}")
             bundle, filename = parts
-            stem = (
-                filename.removesuffix(".v5.supf")
-                if filename.endswith(".v5.supf")
-                else filename.removesuffix(".supf")
+            suffix = next(
+                s
+                for s in (".v5.supf", ".v4.supp", ".supf", ".supp")
+                if filename.endswith(s)
             )
+            stem = filename.removesuffix(suffix)
             binary_path = bundle + "/" + stem
-            sinf_name = (
-                stem + ".v4.sinf" if filename.endswith(".v5.supf") else stem + ".sinf"
-            )
-            sinf_path = bundle + "/SC_Info/" + sinf_name
-            if sinf_path not in names and filename.endswith(".v5.supf"):
+            if suffix in (".v5.supf", ".v4.supp"):
+                sinf_path = bundle + "/SC_Info/" + stem + ".v4.sinf"
+                if sinf_path not in names:
+                    sinf_path = bundle + "/SC_Info/" + stem + ".sinf"
+            else:
                 sinf_path = bundle + "/SC_Info/" + stem + ".sinf"
             if binary_path not in names:
                 raise ValueError(f"SUPF lacks binary/SINF: {supf_path}")
